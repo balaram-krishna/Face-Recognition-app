@@ -1,9 +1,7 @@
 streamlit
 opencv-python-headless
+numpy
+pandas
+pillow
 insightface
 onnxruntime
-numpy
-pillow
-scipy
-protobuf
-
