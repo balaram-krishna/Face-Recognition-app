@@ -79,18 +79,55 @@ if group_photo and known_faces:
     # Display group image with results
     st.image(draw, caption="Detected Faces", use_container_width=True)
 
-    # Mark attendance
+    # Attendance logic
     present_students = set([n for n in recognized if n != "Unknown"])
     all_students = set(known_names)
     absent_students = all_students - present_students
 
+    st.markdown("### 🧾 AI-Detected Attendance Summary")
+
+    # ================== MANUAL CHECKBOX SECTION ==================
+    st.info("⚙️ If the AI missed someone, mark them manually below:")
+    manual_present = []
+    manual_absent = []
+
+    for student in all_students:
+        if student in present_students:
+            checked = st.checkbox(f"{student} (Detected Present)", value=True)
+        else:
+            checked = st.checkbox(f"{student} (Detected Absent)", value=False)
+        
+        if checked:
+            manual_present.append(student)
+        else:
+            manual_absent.append(student)
+
+    # Final attendance after manual corrections
+    present_students = set(manual_present)
+    absent_students = set(manual_absent)
+
+    # Display in two columns
+    col1, col2 = st.columns(2)
+    with col1:
+        st.success("✅ Present Students")
+        st.write(list(present_students) if present_students else ["None"])
+    with col2:
+        st.error("❌ Absent Students")
+        st.write(list(absent_students) if absent_students else ["None"])
+
+    # Save attendance
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     attendance_data = pd.read_csv(ATTENDANCE_FILE)
 
     new_records = []
     for name in all_students:
         status = "Present" if name in present_students else "Absent"
-        new_records.append({"Name": name, "Status": status, "Time": current_time, "Group Photo": group_photo.name})
+        new_records.append({
+            "Name": name,
+            "Status": status,
+            "Time": current_time,
+            "Group Photo": group_photo.name
+        })
 
     df_new = pd.DataFrame(new_records)
     attendance_data = pd.concat([attendance_data, df_new], ignore_index=True)
@@ -98,10 +135,7 @@ if group_photo and known_faces:
 
     st.success("✅ Attendance Recorded Successfully!")
 
-    st.markdown("### 🗓️ Attendance Summary")
-    st.dataframe(df_new)
-
-    # Download button
+    # Download button for CSV
     csv = df_new.to_csv(index=False).encode('utf-8')
     st.download_button(
         label="⬇️ Download This Session Attendance",
@@ -112,5 +146,3 @@ if group_photo and known_faces:
 
 elif group_photo and not known_faces:
     st.warning("⚠️ Please upload student photos first before uploading group image!")
-
-
