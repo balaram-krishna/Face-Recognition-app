@@ -1,13 +1,14 @@
 # app.py
 """
-Smart College Face Attendance — Final Production Edition
+Smart College Face Attendance — Multi-Capture Edition
+- Multi-capture (N photos) per period; detections merged across all captures
 - FACULTY NAME label, auto time (override), 12-hour format (AM/PM)
 - Thin boxes, flip-fallback, cached embeddings
 - Manual override + Enroll Unknown Face workflow
 - Structured Attendance Records tab (TODAY only)
 - "Generate Full-Day Report" button (manual), merges all period CSVs for the day
 - Professional filenames: YYYY-MM-DD_HH-MMAMPM_Period-#_Subject_Faculty.csv
-- Uses st.rerun() for reloads (no deprecated calls)
+- Uses st.rerun() for reloads
 """
 
 import os
@@ -24,7 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 from insightface.app import FaceAnalysis
 
 # ---------------- CONFIG ----------------
-st.set_page_config(page_title="Smart College Face Attendance" , layout="wide")
+st.set_page_config(page_title="Smart College Face Attendance", layout="wide")
 ROOT_REG = "registered_faces"
 ROOT_SAVE = "attendance_records"
 os.makedirs(ROOT_REG, exist_ok=True)
@@ -52,7 +53,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown("<div class='title'>📸 Smart College Face Attendance</div>", unsafe_allow_html=True)
+st.markdown("<div class='title'> Digital ICFAI Attendance</div>", unsafe_allow_html=True)
 st.write("")
 
 # ---------------- MODEL ----------------
@@ -177,7 +178,9 @@ with st.sidebar:
     subject = st.text_input("Subject name")
     faculty = st.text_input("FACULTY NAME")
     period = st.selectbox("Period", [f"Period {i}" for i in range(1,9)])
-    mode = st.radio("Photo source", ["Webcam (capture)", "Upload photo"])
+    # Photo source is already used in main logic, but keep here to preserve previous UX
+    mode = st.radio("Photo source", ["Webcam (capture)", "Upload photos"])
+    num_clicks = st.number_input("Number of captures (per lecture)", min_value=1, max_value=10, value=3, step=1)
     auto_time = datetime.now()
     time_default = format_time_display(auto_time)
     time_input = st.text_input("Time (HH:MM AM/PM) — override if needed", value=time_default)
@@ -196,151 +199,192 @@ tab_take, tab_records = st.tabs(["📸 Take Attendance", "📄 Attendance Record
 
 # ---------------- TAB: Take Attendance ----------------
 with tab_take:
-    st.subheader("Capture / Upload group photo")
-    group_bgr = None
+    st.subheader("Capture / Upload group photo(s)")
+
+    # We'll collect captured images in a list, then process them on demand
+    captured_images = []
+
     if mode == "Webcam (capture)":
-        cam = st.camera_input("Take a group photo")
-        if cam:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-                tmp.write(cam.read())
-                tmp.flush()
-                group_bgr = cv2.imread(tmp.name)
+        st.info(f"Use the camera widgets below to capture up to {num_clicks} photos. After capturing, click 'Process captures' to detect faces across all photos.")
+        cam_cols = st.columns(2)
+        # render multiple camera_input widgets; they will persist uploaded bytes in each widget
+        cam_widgets = []
+        for i in range(num_clicks):
+            # show them in two-column layout
+            col = cam_cols[i % 2]
+            with col:
+                cam = st.camera_input(f"Take photo #{i+1}")
+                cam_widgets.append(cam)
+        # convert provided camera inputs into images
+        for cam in cam_widgets:
+            if cam:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                    tmp.write(cam.read())
+                    tmp.flush()
+                    img = cv2.imread(tmp.name)
+                    if img is not None:
+                        captured_images.append(img)
+
     else:
-        up = st.file_uploader("Upload group photo", type=["jpg","jpeg","png"])
-        if up:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-                tmp.write(up.read())
-                tmp.flush()
-                group_bgr = cv2.imread(tmp.name)
+        st.info(f"Upload up to {num_clicks} group photos and then click 'Process captures'")
+        uploaded = st.file_uploader(
+            "Upload group photos (multiple)",
+            type=["jpg", "jpeg", "png"],
+            accept_multiple_files=True
+        )
+        if uploaded:
+            for up in uploaded[:num_clicks]:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                    tmp.write(up.read())
+                    tmp.flush()
+                    img = cv2.imread(tmp.name)
+                    if img is not None:
+                        captured_images.append(img)
 
-    unknown_previews = []  # crops for enroll
+    # Process captures button
+    if st.button("Process captures") or (captured_images and st.session_state.get("auto_process_immediate", False)):
+        if not captured_images:
+            st.warning("No photos captured or uploaded. Please capture/upload photos first.")
+        else:
+            t0_all = time.time()
+            all_detected = set()
+            unknown_previews = []  # list of dicts {crop: PIL.Image, score: float}
+            last_annotated = None
+            process_times = []
+            for idx_img, group_bgr in enumerate(captured_images, start=1):
+                t0 = time.time()
+                # resize large images for consistent processing
+                H, W = group_bgr.shape[:2]
+                maxdim = 900
+                if max(H, W) > maxdim:
+                    scale = maxdim / max(H, W)
+                    group_bgr = cv2.resize(group_bgr, (int(W*scale), int(H*scale)))
+                faces = model.get(group_bgr)
+                pil_img = pil_from_bgr(group_bgr)
+                for face in faces:
+                    emb = normalize(face.normed_embedding.astype(np.float32))
+                    best_name, best_score, matched = match_face_vectorized(emb)
+                    if not matched:
+                        # flipped fallback
+                        try:
+                            x1, y1, x2, y2 = [int(v) for v in face.bbox]
+                            crop_bgr = group_bgr[max(0, y1):y2, max(0, x1):x2]
+                            if crop_bgr.size != 0:
+                                flip = cv2.flip(crop_bgr, 1)
+                                faces_f = model.get(flip)
+                                if faces_f:
+                                    emb_f = normalize(faces_f[0].normed_embedding.astype(np.float32))
+                                    bn, bs, bm = match_face_vectorized(emb_f)
+                                    if bm:
+                                        best_name, best_score, matched = bn, bs, True
+                        except Exception:
+                            pass
 
-    if group_bgr is not None:
-        t0 = time.time()
-        H, W = group_bgr.shape[:2]
-        maxdim = 900
-        if max(H, W) > maxdim:
-            scale = maxdim / max(H, W)
-            group_bgr = cv2.resize(group_bgr, (int(W*scale), int(H*scale)))
+                    if matched and best_name is not None:
+                        all_detected.add(best_name)
+                    else:
+                        # prepare unknown preview crop
+                        try:
+                            x1, y1, x2, y2 = [int(v) for v in face.bbox]
+                            crop = pil_img.crop((x1, y1, x2, y2)).resize((160, 160))
+                            unknown_previews.append({"crop": crop, "score": float(best_score)})
+                        except Exception:
+                            pass
 
-        faces = model.get(group_bgr)
-        pil_img = pil_from_bgr(group_bgr)
-        detected = set()
+                    draw_box_label(pil_img, face.bbox, best_name if matched else "Unknown", matched)
+                last_annotated = pil_img
+                t1 = time.time()
+                process_times.append(t1 - t0)
 
-        for face in faces:
-            emb = normalize(face.normed_embedding.astype(np.float32))
-            best_name, best_score, matched = match_face_vectorized(emb)
-            if not matched:
-                # flipped fallback
-                x1,y1,x2,y2 = [int(v) for v in face.bbox]
+            t1_all = time.time()
+            st.success(f"Processed {len(captured_images)} photo(s) in {t1_all - t0_all:.2f} sec (avg {np.mean(process_times):.2f}s per image)")
+
+            # Show annotated last image (if available)
+            if last_annotated is not None:
+                st.image(last_annotated, caption="Annotated last processed photo (others processed too)", use_container_width=True)
+
+            # Build attendance baseline (union across captures)
+            attendance_rows = []
+            for nm in names:
+                attendance_rows.append({"Student Name": nm.replace("_", " "), "Status": "Present" if nm in all_detected else "Absent"})
+
+            # Session metadata display once
+            st.markdown("<div class='meta'>", unsafe_allow_html=True)
+            st.write(f"**Subject:** {subject or '—'}  |  **Faculty:** {faculty or '—'}  |  **Period:** {period}  |  **Date:** {date.today().isoformat()}  |  **Time:** {time_input}")
+            st.markdown("</div>")
+            st.markdown("")
+
+            # Manual override UI
+            st.subheader("Attendance — verify & edit")
+            edited = []
+            present_count = 0
+            for i, row in enumerate(attendance_rows):
+                checked = st.checkbox(row["Student Name"], value=(row["Status"] == "Present"), key=f"chk_{i}")
+                status = "Present" if checked else "Absent"
+                if status == "Present":
+                    present_count += 1
+                edited.append({"Student Name": row["Student Name"], "Status": status})
+            df_display = pd.DataFrame(edited)
+            st.markdown(f"**Summary:** ✅ Present: **{present_count}**  |  ❌ Absent: **{len(names) - present_count}**")
+            st.table(df_display[["Student Name", "Status"]])
+
+            # Save attendance (structured) — create filename with 12-hour format
+            if st.button("Save attendance for this period"):
+                # parse time_input to datetime; fallback to now
                 try:
-                    crop_bgr = group_bgr[max(0,y1):y2, max(0,x1):x2]
-                    flip = cv2.flip(crop_bgr, 1)
-                    faces_f = model.get(flip)
-                    if faces_f:
-                        emb_f = normalize(faces_f[0].normed_embedding.astype(np.float32))
-                        bn, bs, bm = match_face_vectorized(emb_f)
-                        if bm:
-                            best_name, best_score, matched = bn, bs, True
+                    dt_display = datetime.strptime(time_input.strip(), "%I:%M %p")
+                    now_dt = datetime.combine(date.today(), dt_display.time())
                 except Exception:
-                    pass
+                    now_dt = datetime.now()
+                fname = build_filename(now_dt, period, subject, faculty)
+                today_str = date.today().isoformat()
+                folder = os.path.join(ROOT_SAVE, today_str, period.replace(" ", "_"))
+                os.makedirs(folder, exist_ok=True)
+                fpath = os.path.join(folder, fname)
+                df_save = df_display.copy()
+                df_save["Subject"] = subject
+                df_save["Faculty"] = faculty
+                df_save["Period"] = period
+                df_save["Date"] = today_str
+                df_save["Time"] = format_time_display(now_dt)
+                df_save["SavedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                df_save.to_csv(fpath, index=False)
+                st.success(f"Saved → {os.path.relpath(fpath)}")
+                with open(fpath, "rb") as fh:
+                    st.download_button("Download CSV", fh.read(), file_name=fname, mime="text/csv")
 
-            if matched:
-                detected.add(best_name)
-            else:
-                x1,y1,x2,y2 = [int(v) for v in face.bbox]
-                try:
-                    crop = pil_img.crop((x1, y1, x2, y2)).resize((160,160))
-                    unknown_previews.append({"crop": crop, "score": float(best_score)})
-                except Exception:
-                    pass
+            # Enroll unknown faces workflow (quick)
+            if unknown_previews:
+                st.markdown("---")
+                st.subheader("Enroll Unknown Faces (quick)")
+                enroll_cols = st.columns(3)
+                enroll_inputs = []
+                # show up to first 12 unknown previews to keep UI tidy
+                for idx, item in enumerate(unknown_previews[:12]):
+                    col = enroll_cols[idx % 3]
+                    with col:
+                        st.image(item["crop"], width=160)
+                        st.caption(f"AI score: {item['score']:.2f}")
+                        name_input = st.text_input(f"Label for face #{idx+1}", key=f"enroll_name_{idx}")
+                        enroll_inputs.append((idx, item["crop"], name_input))
 
-            draw_box_label(pil_img, face.bbox, best_name if matched else "Unknown", matched)
+                if st.button("Enroll labeled faces into registry"):
+                    saved = 0
+                    for idx, crop, label in enroll_inputs:
+                        if label and label.strip():
+                            save_enrolled_image(crop, label.strip())
+                            saved += 1
+                    if saved > 0:
+                        st.success(f"Enrolled {saved} faces. Reloading registry...")
+                        load_registered.clear()
+                        time.sleep(0.8)
+                        st.rerun()
+                    else:
+                        st.warning("No labels entered. Please type a name for each face you want to enroll.")
 
-        st.image(pil_img, caption="Annotated group photo", use_container_width=True)
-        t1 = time.time()
-
-        # Build attendance baseline (only show Student Name + Status)
-        attendance_rows = []
-        for nm in names:
-            attendance_rows.append({"Student Name": nm.replace("_"," "), "Status": "Present" if nm in detected else "Absent"})
-
-        # Session metadata display once
-        st.markdown("<div class='meta'>", unsafe_allow_html=True)
-        st.write(f"**Subject:** {subject or '—'}  |  **Faculty:** {faculty or '—'}  |  **Period:** {period}  |  **Date:** {date.today().isoformat()}  |  **Time:** {time_input}")
-        st.markdown("</div>")
-        st.markdown("")
-
-        # Manual override UI
-        st.subheader("Attendance — verify & edit")
-        edited = []
-        present_count = 0
-        for i, row in enumerate(attendance_rows):
-            checked = st.checkbox(row["Student Name"], value=(row["Status"]=="Present"), key=f"chk_{i}")
-            status = "Present" if checked else "Absent"
-            if status == "Present":
-                present_count += 1
-            edited.append({"Student Name": row["Student Name"], "Status": status})
-        df_display = pd.DataFrame(edited)
-        st.markdown(f"**Summary:** ✅ Present: **{present_count}**  |  ❌ Absent: **{len(names)-present_count}**")
-        st.table(df_display[["Student Name","Status"]])
-
-        # Save attendance (structured) — create filename with 12-hour format
-        if st.button("Save attendance for this period"):
-            # parse time_input to datetime; fallback to now
-            try:
-                dt_display = datetime.strptime(time_input.strip(), "%I:%M %p")
-                now_dt = datetime.combine(date.today(), dt_display.time())
-            except Exception:
-                now_dt = datetime.now()
-            fname = build_filename(now_dt, period, subject, faculty)
-            today_str = date.today().isoformat()
-            folder = os.path.join(ROOT_SAVE, today_str, period.replace(" ", "_"))
-            os.makedirs(folder, exist_ok=True)
-            fpath = os.path.join(folder, fname)
-            df_save = df_display.copy()
-            df_save["Subject"] = subject
-            df_save["Faculty"] = faculty
-            df_save["Period"] = period
-            df_save["Date"] = today_str
-            df_save["Time"] = format_time_display(now_dt)
-            df_save["SavedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            df_save.to_csv(fpath, index=False)
-            st.success(f"Saved → {os.path.relpath(fpath)}")
-            with open(fpath, "rb") as fh:
-                st.download_button("Download CSV", fh.read(), file_name=fname, mime="text/csv")
-
-        # Enroll unknown faces workflow (quick)
-        if unknown_previews:
-            st.markdown("---")
-            st.subheader("Enroll Unknown Faces (quick)")
-            enroll_cols = st.columns(3)
-            enroll_inputs = []
-            for idx, item in enumerate(unknown_previews):
-                col = enroll_cols[idx % 3]
-                with col:
-                    st.image(item["crop"], width=160)
-                    st.caption(f"AI score: {item['score']:.2f}")
-                    name_input = st.text_input(f"Label for face #{idx+1}", key=f"enroll_name_{idx}")
-                    enroll_inputs.append((idx, item["crop"], name_input))
-
-            if st.button("Enroll labeled faces into registry"):
-                saved = 0
-                for idx, crop, label in enroll_inputs:
-                    if label and label.strip():
-                        save_enrolled_image(crop, label.strip())
-                        saved += 1
-                if saved > 0:
-                    st.success(f"Enrolled {saved} faces. Reloading registry...")
-                    load_registered.clear()
-                    time.sleep(0.8)
-                    st.rerun()
-                else:
-                    st.warning("No labels entered. Please type a name for each face you want to enroll.")
-
-        st.caption(f"Processed in {t1 - t0:.2f} sec (typical 1–2s on CPU).")
+            st.caption(f"Unique detected students across captures: {len(all_detected)}")
     else:
-        st.info("Capture (webcam) or upload a photo to start attendance.")
+        st.info("Capture (webcam) or upload a photo to start attendance. After capturing/uploading the desired photos, click 'Process captures' to detect across all photos.")
 
 # ---------------- TAB: Attendance Records (Today) ----------------
 with tab_records:
