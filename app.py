@@ -509,3 +509,4 @@ with tab_records:
                             st.download_button("Download Day Report (CSV)", fh.read(), file_name=day_fname, mime="text/csv")
                     else:
                         st.info("No period records found to merge for today.")
+
